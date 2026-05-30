@@ -1,16 +1,14 @@
 require("dotenv").config();
 
 const express = require("express");
-const axios = require("axios");
 const qrcode = require("qrcode");
-const pino = require("pino");
-const fs = require("fs");
+const P = require("pino");
 
 const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    DisconnectReason
 } = require("@whiskeysockets/baileys");
 
 const app = express();
@@ -19,182 +17,168 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 let sock = null;
-
-let qrBase64 = null;
-let isConnected = false;
+let qrCode = null;
+let connected = false;
 let connecting = false;
-let retryCount = 0;
 
-/* =========================
-   QR ROUTES
-========================= */
+async function startWhatsApp() {
 
-// JSON QR
-app.get("/qr", (req, res) => {
-  res.json({
-    connected: isConnected,
-    qr: qrBase64
-  });
-});
+    if (connecting) return;
+    connecting = true;
 
-// QR image
-app.get("/qr.png", (req, res) => {
-  if (!qrBase64) return res.status(404).send("QR not ready");
+    try {
 
-  const base64 = qrBase64.split(",")[1];
-  const img = Buffer.from(base64, "base64");
+        const { state, saveCreds } =
+            await useMultiFileAuthState("auth");
 
-  res.setHeader("Content-Type", "image/png");
-  res.send(img);
-});
+        const { version } =
+            await fetchLatestBaileysVersion();
 
-/* =========================
-   SEND MESSAGE ROUTE
-========================= */
+        sock = makeWASocket({
+            version,
+            auth: state,
+            logger: P({ level: "silent" }),
+            browser: ["KiroFlix", "Chrome", "1.0"]
+        });
 
-app.post("/send", async (req, res) => {
-  try {
-    const { to, text } = req.body;
+        sock.ev.on("creds.update", saveCreds);
 
-    if (!sock) {
-      return res.status(500).json({ error: "WhatsApp not ready" });
-    }
+        sock.ev.on("connection.update", async (update) => {
 
-    if (!to || !text) {
-      return res.status(400).json({ error: "to and text required" });
-    }
+            const {
+                connection,
+                qr,
+                lastDisconnect
+            } = update;
 
-    await sock.sendMessage(to, { text });
+            if (qr) {
+                qrCode = await qrcode.toDataURL(qr);
+                console.log("QR Generated");
+            }
 
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+            if (connection === "open") {
+                connected = true;
+                qrCode = null;
+                console.log("Connected");
+            }
 
-/* =========================
-   START BOT
-========================= */
+            if (connection === "close") {
 
-async function startBot() {
-  if (connecting) return;
-  connecting = true;
+                connected = false;
 
-  try {
-    console.log("🚀 Starting WhatsApp...");
+                const code =
+                    lastDisconnect?.error?.output?.statusCode;
 
-    const { state, saveCreds } = await useMultiFileAuthState("auth");
-    const { version } = await fetchLatestBaileysVersion();
+                console.log("Disconnected:", code);
 
-    sock = makeWASocket({
-      version,
-      logger: pino({ level: "silent" }),
-      auth: state,
-      browser: ["Bot", "Chrome", "1.0"]
-    });
+                if (
+                    code !== DisconnectReason.loggedOut
+                ) {
 
-    /* =========================
-       CONNECTION UPDATE
-    ========================= */
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, qr, lastDisconnect } = update;
+                    setTimeout(() => {
+                        connecting = false;
+                        startWhatsApp();
+                    }, 5000);
 
-      if (qr) {
-        console.log("📲 QR generated");
-        qrBase64 = await qrcode.toDataURL(qr);
-      }
+                }
+            }
 
-      if (connection === "open") {
-        console.log("✅ Connected");
-        isConnected = true;
-        qrBase64 = null;
-        retryCount = 0;
-      }
+        });
 
-      if (connection === "close") {
-        isConnected = false;
-        qrBase64 = null;
+    } catch (err) {
 
-        const code = lastDisconnect?.error?.output?.statusCode;
-        console.log("❌ Closed:", code);
-
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
-
-        if (!shouldReconnect) {
-          console.log("🚫 Logged out, stop reconnect");
-          return;
-        }
-
-        retryCount++;
-        const delay = Math.min(30000, retryCount * 4000);
-
-        console.log(`🔁 Reconnecting in ${delay}ms`);
+        console.log(err);
 
         setTimeout(() => {
-          connecting = false;
-          startBot();
-        }, delay);
-      }
-    });
+            connecting = false;
+            startWhatsApp();
+        }, 5000);
 
-    sock.ev.on("creds.update", saveCreds);
+    } finally {
+        connecting = false;
+    }
 
-    /* =========================
-       WEBHOOK (INCOMING MSG)
-    ========================= */
-    sock.ev.on("messages.upsert", async ({ messages }) => {
-      const msg = messages?.[0];
-      if (!msg?.message) return;
-      if (msg.key.fromMe) return;
-
-      const from = msg.key.remoteJid;
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        "";
-
-      console.log("📩 Incoming:", from, text);
-
-      // webhook
-      if (process.env.WEBHOOK_URL) {
-        try {
-          await axios.post(process.env.WEBHOOK_URL, {
-            from,
-            text
-          });
-        } catch (err) {
-          console.log("Webhook error:", err.message);
-        }
-      }
-    });
-
-  } catch (err) {
-    console.log("💥 Fatal:", err.message);
-
-    setTimeout(() => {
-      connecting = false;
-      startBot();
-    }, 5000);
-  } finally {
-    connecting = false;
-  }
 }
 
-/* =========================
-   ROOT
-========================= */
+/*
+|--------------------------------------------------------------------------
+| STATUS
+|--------------------------------------------------------------------------
+*/
 
-app.get("/", (req, res) => {
-  res.send("WhatsApp Bot Running");
+app.get("/status", (req, res) => {
+
+    res.json({
+        connected
+    });
+
 });
 
-/* =========================
-   START
-========================= */
+/*
+|--------------------------------------------------------------------------
+| QR
+|--------------------------------------------------------------------------
+*/
 
-startBot();
+app.get("/qr", (req, res) => {
+
+    res.json({
+        connected,
+        qr: qrCode
+    });
+
+});
+
+/*
+|--------------------------------------------------------------------------
+| SEND
+|--------------------------------------------------------------------------
+*/
+
+app.post("/send", async (req, res) => {
+
+    try {
+
+        const { to, text } = req.body;
+
+        if (!connected) {
+            return res.status(400).json({
+                success: false,
+                message: "WhatsApp not connected"
+            });
+        }
+
+        await sock.sendMessage(to, {
+            text
+        });
+
+        res.json({
+            success: true
+        });
+
+    } catch (err) {
+
+        res.status(500).json({
+            success: false,
+            error: err.message
+        });
+
+    }
+
+});
+
+/*
+|--------------------------------------------------------------------------
+| HOME
+|--------------------------------------------------------------------------
+*/
+
+app.get("/", (req, res) => {
+    res.send("WhatsApp Gateway Running");
+});
+
+startWhatsApp();
 
 app.listen(PORT, () => {
-  console.log("🌐 Server running on port", PORT);
+    console.log("Server running on port", PORT);
 });
