@@ -4,6 +4,10 @@ const express = require("express");
 const qrcode = require("qrcode");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
+const archiver = require("archiver");
+const unzipper = require("unzipper");
+const FormData = require("form-data");
 const P = require("pino");
 
 const {
@@ -18,432 +22,251 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-process.on("unhandledRejection", err => {
-    console.error("Unhandled Rejection:", err);
-});
-
-process.on("uncaughtException", err => {
-    console.error("Uncaught Exception:", err);
-});
+const BASE_URL = "https://websland.kiroflix.site/assistant";
 
 const sessions = {};
 
-function authPath(sessionId) {
-    return path.join("auth", sessionId);
+function authPath(id) {
+    return path.join("auth", id);
 }
 
-function wait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+function zipPath(id) {
+    return path.join("backup", `${id}.zip`);
 }
 
-function sessionExists(sessionId) {
-    return Boolean(sessions[sessionId]);
+fs.mkdirSync("auth", { recursive: true });
+fs.mkdirSync("backup", { recursive: true });
+
+/* -------------------- ZIP + UPLOAD -------------------- */
+
+async function zipSession(sessionId) {
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(zipPath(sessionId));
+        const archive = archiver("zip", { zlib: { level: 9 } });
+
+        output.on("close", resolve);
+        archive.on("error", reject);
+
+        archive.pipe(output);
+        archive.directory(authPath(sessionId), false);
+        archive.finalize();
+    });
 }
 
-async function createSession(sessionId) {
+async function uploadBackup(sessionId) {
     try {
-        if (sessionExists(sessionId)) {
-            return sessions[sessionId];
-        }
+        await zipSession(sessionId);
 
-        console.log(`[${sessionId}] Creating session`);
+        const form = new FormData();
+        form.append("session", sessionId);
+        form.append("file", fs.createReadStream(zipPath(sessionId)));
 
-        fs.mkdirSync(authPath(sessionId), {
-            recursive: true
+        await axios.post(`${BASE_URL}/upload.php`, form, {
+            headers: form.getHeaders()
         });
 
-        sessions[sessionId] = {
-            sessionId,
-            sock: null,
-            qr: null,
-            connected: false,
-            connecting: false,
-            reconnecting: false,
-            lastActivity: Date.now()
-        };
-
-        startSession(sessionId);
-
-        return sessions[sessionId];
+        console.log(`[${sessionId}] backup uploaded`);
     } catch (err) {
-        console.error(
-            `[${sessionId}] createSession error:`,
-            err.message
-        );
-
-        return null;
+        console.error(`[${sessionId}] backup error`, err.message);
     }
+}
+
+/* -------------------- RESTORE -------------------- */
+
+async function downloadBackup(sessionId) {
+    try {
+        const res = await axios.get(`${BASE_URL}/download.php`, {
+            params: { session: sessionId },
+            responseType: "stream"
+        });
+
+        const zipFile = zipPath(sessionId);
+        const writer = fs.createWriteStream(zipFile);
+
+        await new Promise((resolve, reject) => {
+            res.data.pipe(writer);
+            writer.on("finish", resolve);
+            writer.on("error", reject);
+        });
+
+        await fs.createReadStream(zipFile)
+            .pipe(unzipper.Extract({ path: authPath(sessionId) }))
+            .promise();
+
+        console.log(`[${sessionId}] restored from backup`);
+        return true;
+    } catch (err) {
+        console.log(`[${sessionId}] no backup found`);
+        return false;
+    }
+}
+
+/* -------------------- SESSION CORE -------------------- */
+
+async function createSession(sessionId) {
+    if (sessions[sessionId]) return sessions[sessionId];
+
+    console.log(`[${sessionId}] creating session`);
+
+    fs.mkdirSync(authPath(sessionId), { recursive: true });
+
+    // restore from server if empty
+    const files = fs.readdirSync(authPath(sessionId));
+    if (files.length === 0) {
+        await downloadBackup(sessionId);
+    }
+
+    sessions[sessionId] = {
+        sessionId,
+        sock: null,
+        qr: null,
+        connected: false,
+        connecting: false,
+        lastActivity: Date.now()
+    };
+
+    startSession(sessionId);
+    return sessions[sessionId];
 }
 
 async function startSession(sessionId) {
     const session = sessions[sessionId];
-
-    if (!session || session.connecting) {
-        return;
-    }
+    if (!session || session.connecting) return;
 
     session.connecting = true;
 
     try {
-        console.log(`[${sessionId}] Starting session`);
-
-        const { state, saveCreds } =
-            await useMultiFileAuthState(
-                authPath(sessionId)
-            );
-
-        const { version } =
-            await fetchLatestBaileysVersion();
+        const { state, saveCreds } = await useMultiFileAuthState(authPath(sessionId));
+        const { version } = await fetchLatestBaileysVersion();
 
         const sock = makeWASocket({
             version,
             auth: state,
-            logger: P({
-                level: "silent"
-            }),
-            browser: [
-                "KiroFlix",
-                "Chrome",
-                "1.0"
-            ]
+            logger: P({ level: "silent" }),
+            browser: ["KiroFlix", "Chrome", "1.0"]
         });
 
         session.sock = sock;
 
         sock.ev.on("creds.update", async () => {
-            try {
-                await saveCreds();
-            } catch (err) {
-                console.error(
-                    `[${sessionId}] saveCreds error:`,
-                    err.message
-                );
+            await saveCreds();
+            await uploadBackup(sessionId);
+        });
+
+        sock.ev.on("connection.update", async (u) => {
+            const { connection, qr, lastDisconnect } = u;
+
+            if (qr) {
+                session.qr = await qrcode.toDataURL(qr);
+            }
+
+            if (connection === "open") {
+                session.connected = true;
+                session.qr = null;
+
+                await uploadBackup(sessionId);
+                console.log(`[${sessionId}] connected`);
+            }
+
+            if (connection === "close") {
+                session.connected = false;
+
+                const code = lastDisconnect?.error?.output?.statusCode;
+
+                if (code === DisconnectReason.loggedOut) return;
+
+                setTimeout(() => startSession(sessionId), 5000);
             }
         });
 
-        sock.ev.on(
-            "connection.update",
-            async update => {
-                try {
-                    const {
-                        connection,
-                        qr,
-                        lastDisconnect
-                    } = update;
-
-                    if (qr) {
-                        session.qr =
-                            await qrcode.toDataURL(qr);
-
-                        console.log(
-                            `[${sessionId}] QR generated`
-                        );
-                    }
-
-                    if (connection === "open") {
-                        session.connected = true;
-                        session.qr = null;
-
-                        console.log(
-                            `[${sessionId}] Connected`
-                        );
-                    }
-
-                    if (connection === "close") {
-                        session.connected = false;
-
-                        const code =
-                            lastDisconnect?.error
-                                ?.output?.statusCode;
-
-                        console.log(
-                            `[${sessionId}] Disconnected`,
-                            code
-                        );
-
-                        if (
-                            code ===
-                            DisconnectReason.loggedOut
-                        ) {
-                            console.log(
-                                `[${sessionId}] Logged out`
-                            );
-
-                            return;
-                        }
-
-                        if (
-                            session.reconnecting
-                        ) {
-                            return;
-                        }
-
-                        session.reconnecting = true;
-
-                        setTimeout(() => {
-                            session.reconnecting = false;
-
-                            startSession(
-                                sessionId
-                            );
-                        }, 5_000);
-                    }
-                } catch (err) {
-                    console.error(
-                        `[${sessionId}] connection.update error:`,
-                        err.message
-                    );
-                }
-            }
-        );
     } catch (err) {
-        console.error(
-            `[${sessionId}] startSession error:`,
-            err.message
-        );
+        console.error(`[${sessionId}] start error`, err.message);
     } finally {
         session.connecting = false;
     }
 }
 
+/* -------------------- AUTO RESTORE ALL ON START -------------------- */
+
+async function restoreAllSessions() {
+    try {
+        const res = await axios.get(`${BASE_URL}/list.php`);
+        const list = res.data.sessions || [];
+
+        for (const id of list) {
+            console.log(`[BOOT] restoring ${id}`);
+            await createSession(id);
+        }
+    } catch (err) {
+        console.log("restore list failed:", err.message);
+    }
+}
+
+/* -------------------- API -------------------- */
+
 app.get("/", (req, res) => {
-    res.json({
-        success: true,
-        service: "WhatsApp Gateway"
-    });
+    res.json({ ok: true, service: "WhatsApp Gateway" });
 });
 
 app.get("/qr", async (req, res) => {
-    try {
-        const { session: sessionId } =
-            req.query;
+    const { session } = req.query;
+    if (!session) return res.status(400).json({ error: "session required" });
 
-        if (!sessionId) {
-            return res.status(400).json({
-                success: false,
-                error: "session required"
-            });
-        }
+    const s = await createSession(session);
+    await new Promise(r => setTimeout(r, 2000));
 
-        let session =
-            sessions[sessionId];
-
-        if (!session) {
-            session =
-                await createSession(
-                    sessionId
-                );
-
-            await wait(3_000);
-        }
-
-        res.json({
-            success: true,
-            session: sessionId,
-            connected:
-                session?.connected ||
-                false,
-            qr: session?.qr || null
-        });
-    } catch (err) {
-        res.status(500).json({
-            success: false,
-            error: err.message
-        });
-    }
-});
-
-app.get("/status", async (req, res) => {
-    try {
-        const { session: sessionId } =
-            req.query;
-
-        if (!sessionId) {
-            return res.status(400).json({
-                success: false,
-                error: "session required"
-            });
-        }
-
-        let session =
-            sessions[sessionId];
-
-        if (
-            !session &&
-            fs.existsSync(
-                authPath(sessionId)
-            )
-        ) {
-            session =
-                await createSession(
-                    sessionId
-                );
-
-            await wait(2_000);
-        }
-
-        res.json({
-            success: true,
-            session: sessionId,
-            connected:
-                session?.connected ||
-                false
-        });
-    } catch (err) {
-        res.status(500).json({
-            success: false,
-            error: err.message
-        });
-    }
+    res.json({
+        session,
+        connected: s?.connected,
+        qr: s?.qr || null
+    });
 });
 
 app.post("/send", async (req, res) => {
-    try {
-        const {
-            session: sessionId,
-            to,
-            text
-        } = req.body;
+    const { session, to, text } = req.body;
 
-        if (
-            !sessionId ||
-            !to ||
-            !text
-        ) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    "session, to and text required"
-            });
-        }
+    if (!session || !to || !text)
+        return res.status(400).json({ error: "missing fields" });
 
-        let session =
-            sessions[sessionId];
+    const s = await createSession(session);
 
-        if (
-            !session &&
-            fs.existsSync(
-                authPath(sessionId)
-            )
-        ) {
-            session =
-                await createSession(
-                    sessionId
-                );
+    if (!s.connected)
+        return res.status(400).json({ error: "not connected" });
 
-            await wait(5_000);
-        }
+    await s.sock.sendMessage(to, { text });
+    s.lastActivity = Date.now();
 
-        if (!session) {
-            return res.status(404).json({
-                success: false,
-                error:
-                    "session not found"
-            });
-        }
-
-        if (!session.connected) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    "whatsapp not connected"
-            });
-        }
-
-        await session.sock.sendMessage(
-            to,
-            { text }
-        );
-
-        session.lastActivity =
-            Date.now();
-
-        res.json({
-            success: true
-        });
-    } catch (err) {
-        console.error(
-            "Send Error:",
-            err.message
-        );
-
-        res.status(500).json({
-            success: false,
-            error: err.message
-        });
-    }
+    res.json({ success: true });
 });
 
 app.post("/logout", async (req, res) => {
-    try {
-        const {
-            session: sessionId
-        } = req.body;
+    const { session } = req.body;
 
-        if (!sessionId) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    "session required"
-            });
-        }
-
-        const session =
-            sessions[sessionId];
-
-        try {
-            await session?.sock?.logout();
-        } catch (err) {
-            console.error(
-                `[${sessionId}] logout error:`,
-                err.message
-            );
-        }
-
-        delete sessions[sessionId];
-
-        fs.rmSync(
-            authPath(sessionId),
-            {
-                recursive: true,
-                force: true
-            }
-        );
-
-        res.json({
-            success: true
-        });
-    } catch (err) {
-        res.status(500).json({
-            success: false,
-            error: err.message
-        });
+    if (sessions[session]?.sock) {
+        try { await sessions[session].sock.logout(); } catch {}
     }
+
+    delete sessions[session];
+    fs.rmSync(authPath(session), { recursive: true, force: true });
+
+    res.json({ success: true });
 });
+
+/* -------------------- CLEANER -------------------- */
 
 setInterval(() => {
     const now = Date.now();
 
-    for (const [id, session] of Object.entries(
-        sessions
-    )) {
-        const inactive =
-            now -
-                session.lastActivity >
-            60 * 60 * 1000;
-
-        if (inactive) {
-            console.log(
-                `[${id}] Removing inactive session`
-            );
-
+    for (const [id, s] of Object.entries(sessions)) {
+        if (now - s.lastActivity > 3600000) {
             delete sessions[id];
         }
     }
-}, 300_000);
+}, 300000);
 
-app.listen(PORT, () => {
-    console.log(
-        `Server running on port ${PORT}`
-    );
+/* -------------------- START -------------------- */
+
+app.listen(PORT, async () => {
+    console.log(`Server running on ${PORT}`);
+    await restoreAllSessions();
 });
