@@ -1,7 +1,10 @@
+```js
 require("dotenv").config();
 
 const express = require("express");
 const qrcode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
 const P = require("pino");
 
 const {
@@ -12,173 +15,437 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const app = express();
-app.use(express.json());
-
 const PORT = process.env.PORT || 3000;
 
-let sock = null;
-let qrCode = null;
-let connected = false;
-let connecting = false;
+app.use(express.json());
 
-async function startWhatsApp() {
+process.on("unhandledRejection", err => {
+    console.error("Unhandled Rejection:", err);
+});
 
-    if (connecting) return;
-    connecting = true;
+process.on("uncaughtException", err => {
+    console.error("Uncaught Exception:", err);
+});
+
+const sessions = {};
+
+function authPath(sessionId) {
+    return path.join("auth", sessionId);
+}
+
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sessionExists(sessionId) {
+    return Boolean(sessions[sessionId]);
+}
+
+async function createSession(sessionId) {
+    try {
+        if (sessionExists(sessionId)) {
+            return sessions[sessionId];
+        }
+
+        console.log(`[${sessionId}] Creating session`);
+
+        fs.mkdirSync(authPath(sessionId), {
+            recursive: true
+        });
+
+        sessions[sessionId] = {
+            sessionId,
+            sock: null,
+            qr: null,
+            connected: false,
+            connecting: false,
+            reconnecting: false,
+            lastActivity: Date.now()
+        };
+
+        startSession(sessionId);
+
+        return sessions[sessionId];
+    } catch (err) {
+        console.error(
+            `[${sessionId}] createSession error:`,
+            err.message
+        );
+
+        return null;
+    }
+}
+
+async function startSession(sessionId) {
+    const session = sessions[sessionId];
+
+    if (!session || session.connecting) {
+        return;
+    }
+
+    session.connecting = true;
 
     try {
+        console.log(`[${sessionId}] Starting session`);
 
         const { state, saveCreds } =
-            await useMultiFileAuthState("auth");
+            await useMultiFileAuthState(
+                authPath(sessionId)
+            );
 
         const { version } =
             await fetchLatestBaileysVersion();
 
-        sock = makeWASocket({
+        const sock = makeWASocket({
             version,
             auth: state,
-            logger: P({ level: "silent" }),
-            browser: ["KiroFlix", "Chrome", "1.0"]
+            logger: P({
+                level: "silent"
+            }),
+            browser: [
+                "KiroFlix",
+                "Chrome",
+                "1.0"
+            ]
         });
 
-        sock.ev.on("creds.update", saveCreds);
+        session.sock = sock;
 
-        sock.ev.on("connection.update", async (update) => {
-
-            const {
-                connection,
-                qr,
-                lastDisconnect
-            } = update;
-
-            if (qr) {
-                qrCode = await qrcode.toDataURL(qr);
-                console.log("QR Generated");
+        sock.ev.on("creds.update", async () => {
+            try {
+                await saveCreds();
+            } catch (err) {
+                console.error(
+                    `[${sessionId}] saveCreds error:`,
+                    err.message
+                );
             }
+        });
 
-            if (connection === "open") {
-                connected = true;
-                qrCode = null;
-                console.log("Connected");
-            }
+        sock.ev.on(
+            "connection.update",
+            async update => {
+                try {
+                    const {
+                        connection,
+                        qr,
+                        lastDisconnect
+                    } = update;
 
-            if (connection === "close") {
+                    if (qr) {
+                        session.qr =
+                            await qrcode.toDataURL(qr);
 
-                connected = false;
+                        console.log(
+                            `[${sessionId}] QR generated`
+                        );
+                    }
 
-                const code =
-                    lastDisconnect?.error?.output?.statusCode;
+                    if (connection === "open") {
+                        session.connected = true;
+                        session.qr = null;
 
-                console.log("Disconnected:", code);
+                        console.log(
+                            `[${sessionId}] Connected`
+                        );
+                    }
 
-                if (
-                    code !== DisconnectReason.loggedOut
-                ) {
+                    if (connection === "close") {
+                        session.connected = false;
 
-                    setTimeout(() => {
-                        connecting = false;
-                        startWhatsApp();
-                    }, 5000);
+                        const code =
+                            lastDisconnect?.error
+                                ?.output?.statusCode;
 
+                        console.log(
+                            `[${sessionId}] Disconnected`,
+                            code
+                        );
+
+                        if (
+                            code ===
+                            DisconnectReason.loggedOut
+                        ) {
+                            console.log(
+                                `[${sessionId}] Logged out`
+                            );
+
+                            return;
+                        }
+
+                        if (
+                            session.reconnecting
+                        ) {
+                            return;
+                        }
+
+                        session.reconnecting = true;
+
+                        setTimeout(() => {
+                            session.reconnecting = false;
+
+                            startSession(
+                                sessionId
+                            );
+                        }, 5_000);
+                    }
+                } catch (err) {
+                    console.error(
+                        `[${sessionId}] connection.update error:`,
+                        err.message
+                    );
                 }
             }
-
-        });
-
+        );
     } catch (err) {
-
-        console.log(err);
-
-        setTimeout(() => {
-            connecting = false;
-            startWhatsApp();
-        }, 5000);
-
+        console.error(
+            `[${sessionId}] startSession error:`,
+            err.message
+        );
     } finally {
-        connecting = false;
+        session.connecting = false;
     }
-
 }
 
-/*
-|--------------------------------------------------------------------------
-| STATUS
-|--------------------------------------------------------------------------
-*/
-
-app.get("/status", (req, res) => {
-
+app.get("/", (req, res) => {
     res.json({
-        connected
+        success: true,
+        service: "WhatsApp Gateway"
     });
-
 });
 
-/*
-|--------------------------------------------------------------------------
-| QR
-|--------------------------------------------------------------------------
-*/
-
-app.get("/qr", (req, res) => {
-
-    res.json({
-        connected,
-        qr: qrCode
-    });
-
-});
-
-/*
-|--------------------------------------------------------------------------
-| SEND
-|--------------------------------------------------------------------------
-*/
-
-app.post("/send", async (req, res) => {
-
+app.get("/qr", async (req, res) => {
     try {
+        const { session: sessionId } =
+            req.query;
 
-        const { to, text } = req.body;
-
-        if (!connected) {
+        if (!sessionId) {
             return res.status(400).json({
                 success: false,
-                message: "WhatsApp not connected"
+                error: "session required"
             });
         }
 
-        await sock.sendMessage(to, {
-            text
+        let session =
+            sessions[sessionId];
+
+        if (!session) {
+            session =
+                await createSession(
+                    sessionId
+                );
+
+            await wait(3_000);
+        }
+
+        res.json({
+            success: true,
+            session: sessionId,
+            connected:
+                session?.connected ||
+                false,
+            qr: session?.qr || null
         });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            error: err.message
+        });
+    }
+});
+
+app.get("/status", async (req, res) => {
+    try {
+        const { session: sessionId } =
+            req.query;
+
+        if (!sessionId) {
+            return res.status(400).json({
+                success: false,
+                error: "session required"
+            });
+        }
+
+        let session =
+            sessions[sessionId];
+
+        if (
+            !session &&
+            fs.existsSync(
+                authPath(sessionId)
+            )
+        ) {
+            session =
+                await createSession(
+                    sessionId
+                );
+
+            await wait(2_000);
+        }
+
+        res.json({
+            success: true,
+            session: sessionId,
+            connected:
+                session?.connected ||
+                false
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            error: err.message
+        });
+    }
+});
+
+app.post("/send", async (req, res) => {
+    try {
+        const {
+            session: sessionId,
+            to,
+            text
+        } = req.body;
+
+        if (
+            !sessionId ||
+            !to ||
+            !text
+        ) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "session, to and text required"
+            });
+        }
+
+        let session =
+            sessions[sessionId];
+
+        if (
+            !session &&
+            fs.existsSync(
+                authPath(sessionId)
+            )
+        ) {
+            session =
+                await createSession(
+                    sessionId
+                );
+
+            await wait(5_000);
+        }
+
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                error:
+                    "session not found"
+            });
+        }
+
+        if (!session.connected) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "whatsapp not connected"
+            });
+        }
+
+        await session.sock.sendMessage(
+            to,
+            { text }
+        );
+
+        session.lastActivity =
+            Date.now();
 
         res.json({
             success: true
         });
-
     } catch (err) {
+        console.error(
+            "Send Error:",
+            err.message
+        );
 
         res.status(500).json({
             success: false,
             error: err.message
         });
-
     }
-
 });
 
-/*
-|--------------------------------------------------------------------------
-| HOME
-|--------------------------------------------------------------------------
-*/
+app.post("/logout", async (req, res) => {
+    try {
+        const {
+            session: sessionId
+        } = req.body;
 
-app.get("/", (req, res) => {
-    res.send("WhatsApp Gateway Running");
+        if (!sessionId) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "session required"
+            });
+        }
+
+        const session =
+            sessions[sessionId];
+
+        try {
+            await session?.sock?.logout();
+        } catch (err) {
+            console.error(
+                `[${sessionId}] logout error:`,
+                err.message
+            );
+        }
+
+        delete sessions[sessionId];
+
+        fs.rmSync(
+            authPath(sessionId),
+            {
+                recursive: true,
+                force: true
+            }
+        );
+
+        res.json({
+            success: true
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            error: err.message
+        });
+    }
 });
 
-startWhatsApp();
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [id, session] of Object.entries(
+        sessions
+    )) {
+        const inactive =
+            now -
+                session.lastActivity >
+            60 * 60 * 1000;
+
+        if (inactive) {
+            console.log(
+                `[${id}] Removing inactive session`
+            );
+
+            delete sessions[id];
+        }
+    }
+}, 300_000);
 
 app.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+    console.log(
+        `Server running on port ${PORT}`
+    );
 });
+```
