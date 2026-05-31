@@ -1,4 +1,3 @@
-```js
 require("dotenv").config();
 
 const express = require("express");
@@ -448,4 +447,3 @@ app.listen(PORT, () => {
         `Server running on port ${PORT}`
     );
 });
-```
