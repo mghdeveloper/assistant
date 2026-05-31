@@ -5,8 +5,7 @@ const qrcode = require("qrcode");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const archiverImport = require("archiver");
-const archiver = archiverImport.default || archiverImport;
+const archiver = require("archiver").default || require("archiver");
 const unzipper = require("unzipper");
 const FormData = require("form-data");
 const P = require("pino");
@@ -26,6 +25,8 @@ app.use(express.json());
 const BASE_URL = "https://websland.kiroflix.site/assistant";
 
 const sessions = {};
+const backupLocks = {};
+const watchers = {};
 
 function authPath(id) {
     return path.join("auth", id);
@@ -38,7 +39,7 @@ function zipPath(id) {
 fs.mkdirSync("auth", { recursive: true });
 fs.mkdirSync("backup", { recursive: true });
 
-/* -------------------- ZIP + UPLOAD -------------------- */
+/* ---------------- SAFE BACKUP ENGINE ---------------- */
 
 async function zipSession(sessionId) {
     return new Promise((resolve, reject) => {
@@ -55,6 +56,10 @@ async function zipSession(sessionId) {
 }
 
 async function uploadBackup(sessionId) {
+    if (backupLocks[sessionId]) return;
+
+    backupLocks[sessionId] = true;
+
     try {
         await zipSession(sessionId);
 
@@ -66,13 +71,32 @@ async function uploadBackup(sessionId) {
             headers: form.getHeaders()
         });
 
-        console.log(`[${sessionId}] backup uploaded`);
+        console.log(`[${sessionId}] backup synced`);
     } catch (err) {
         console.error(`[${sessionId}] backup error`, err.message);
+    } finally {
+        setTimeout(() => {
+            backupLocks[sessionId] = false;
+        }, 8000);
     }
 }
 
-/* -------------------- RESTORE -------------------- */
+/* ---------------- FILE WATCHER (REAL CHANGE DETECTION) ---------------- */
+
+function watchSessionFiles(sessionId) {
+    const dir = authPath(sessionId);
+
+    if (watchers[sessionId]) return;
+
+    watchers[sessionId] = fs.watch(dir, async (event, filename) => {
+        if (!filename) return;
+
+        console.log(`[${sessionId}] auth changed → syncing backup`);
+        await uploadBackup(sessionId);
+    });
+}
+
+/* ---------------- RESTORE ---------------- */
 
 async function downloadBackup(sessionId) {
     try {
@@ -94,28 +118,22 @@ async function downloadBackup(sessionId) {
             .pipe(unzipper.Extract({ path: authPath(sessionId) }))
             .promise();
 
-        console.log(`[${sessionId}] restored from backup`);
+        console.log(`[${sessionId}] restored`);
         return true;
-    } catch (err) {
-        console.log(`[${sessionId}] no backup found`);
+    } catch {
         return false;
     }
 }
 
-/* -------------------- SESSION CORE -------------------- */
+/* ---------------- SESSION CORE ---------------- */
 
 async function createSession(sessionId) {
     if (sessions[sessionId]) return sessions[sessionId];
 
-    console.log(`[${sessionId}] creating session`);
-
     fs.mkdirSync(authPath(sessionId), { recursive: true });
 
-    // restore from server if empty
-    const files = fs.readdirSync(authPath(sessionId));
-    if (files.length === 0) {
-        await downloadBackup(sessionId);
-    }
+    const empty = fs.readdirSync(authPath(sessionId)).length === 0;
+    if (empty) await downloadBackup(sessionId);
 
     sessions[sessionId] = {
         sessionId,
@@ -140,6 +158,11 @@ async function startSession(sessionId) {
         const { state, saveCreds } = await useMultiFileAuthState(authPath(sessionId));
         const { version } = await fetchLatestBaileysVersion();
 
+        // prevent duplicate sockets
+        if (session.sock) {
+            try { session.sock.end(); } catch {}
+        }
+
         const sock = makeWASocket({
             version,
             auth: state,
@@ -149,10 +172,9 @@ async function startSession(sessionId) {
 
         session.sock = sock;
 
-        sock.ev.on("creds.update", async () => {
-            await saveCreds();
-            await uploadBackup(sessionId);
-        });
+        watchSessionFiles(sessionId);
+
+        sock.ev.on("creds.update", saveCreds);
 
         sock.ev.on("connection.update", async (u) => {
             const { connection, qr, lastDisconnect } = u;
@@ -165,8 +187,9 @@ async function startSession(sessionId) {
                 session.connected = true;
                 session.qr = null;
 
-                await uploadBackup(sessionId);
                 console.log(`[${sessionId}] connected`);
+
+                await uploadBackup(sessionId);
             }
 
             if (connection === "close") {
@@ -176,7 +199,7 @@ async function startSession(sessionId) {
 
                 if (code === DisconnectReason.loggedOut) return;
 
-                setTimeout(() => startSession(sessionId), 5000);
+                setTimeout(() => startSession(sessionId), 4000);
             }
         });
 
@@ -187,26 +210,37 @@ async function startSession(sessionId) {
     }
 }
 
-/* -------------------- AUTO RESTORE ALL ON START -------------------- */
+/* ---------------- RESTORE ALL ---------------- */
 
-async function restoreAllSessions() {
+async function restoreAll() {
     try {
         const res = await axios.get(`${BASE_URL}/list.php`);
-        const list = res.data.sessions || [];
-
-        for (const id of list) {
+        for (const id of res.data.sessions || []) {
             console.log(`[BOOT] restoring ${id}`);
             await createSession(id);
         }
     } catch (err) {
-        console.log("restore list failed:", err.message);
+        console.log("restore failed", err.message);
     }
 }
 
-/* -------------------- API -------------------- */
+/* ---------------- API (FRONTEND FRIENDLY) ---------------- */
 
 app.get("/", (req, res) => {
-    res.json({ ok: true, service: "WhatsApp Gateway" });
+    res.json({ ok: true });
+});
+
+app.get("/status", (req, res) => {
+    const { session } = req.query;
+
+    const s = sessions[session];
+
+    res.json({
+        session,
+        connected: !!(s?.sock?.user?.id),
+        hasSession: !!s,
+        connecting: s?.connecting || false
+    });
 });
 
 app.get("/qr", async (req, res) => {
@@ -214,28 +248,22 @@ app.get("/qr", async (req, res) => {
     if (!session) return res.status(400).json({ error: "session required" });
 
     const s = await createSession(session);
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1500));
 
     res.json({
         session,
-        connected: s?.connected,
-        qr: s?.qr || null
+        qr: s?.qr || null,
+        connected: !!s?.sock?.user?.id
     });
 });
 
 app.post("/send", async (req, res) => {
     const { session, to, text } = req.body;
 
-    if (!session || !to || !text)
-        return res.status(400).json({ error: "missing fields" });
-
-    const s = await createSession(session);
-
-    if (!s.connected)
-        return res.status(400).json({ error: "not connected" });
+    const s = sessions[session];
+    if (!s?.sock?.user) return res.status(400).json({ error: "not connected" });
 
     await s.sock.sendMessage(to, { text });
-    s.lastActivity = Date.now();
 
     res.json({ success: true });
 });
@@ -243,17 +271,18 @@ app.post("/send", async (req, res) => {
 app.post("/logout", async (req, res) => {
     const { session } = req.body;
 
-    if (sessions[session]?.sock) {
-        try { await sessions[session].sock.logout(); } catch {}
-    }
+    try {
+        sessions[session]?.sock?.end();
+    } catch {}
 
     delete sessions[session];
+
     fs.rmSync(authPath(session), { recursive: true, force: true });
 
     res.json({ success: true });
 });
 
-/* -------------------- CLEANER -------------------- */
+/* ---------------- CLEANER ---------------- */
 
 setInterval(() => {
     const now = Date.now();
@@ -265,9 +294,9 @@ setInterval(() => {
     }
 }, 300000);
 
-/* -------------------- START -------------------- */
+/* ---------------- START ---------------- */
 
 app.listen(PORT, async () => {
-    console.log(`Server running on ${PORT}`);
-    await restoreAllSessions();
+    console.log("Server running");
+    await restoreAll();
 });
