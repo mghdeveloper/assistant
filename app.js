@@ -27,6 +27,7 @@ const BASE_URL = "https://websland.kiroflix.site/assistant";
 const sessions = {};
 const backupLocks = {};
 const watchers = {};
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
 function authPath(id) {
     return path.join("auth", id);
@@ -171,6 +172,62 @@ async function startSession(sessionId) {
         });
 
         session.sock = sock;
+        sock.ev.on("messages.upsert", async ({ messages, type }) => {
+
+    for (const msg of messages) {
+
+        try {
+
+            if (!msg.message) continue;
+
+            session.lastActivity = Date.now();
+
+            const text =
+                msg.message?.conversation ||
+                msg.message?.extendedTextMessage?.text ||
+                msg.message?.imageMessage?.caption ||
+                msg.message?.videoMessage?.caption ||
+                "";
+
+            let reply = null;
+
+            const ctx =
+                msg.message?.extendedTextMessage?.contextInfo ||
+                msg.message?.imageMessage?.contextInfo ||
+                msg.message?.videoMessage?.contextInfo;
+
+            if (ctx?.stanzaId) {
+                reply = {
+                    message_id: ctx.stanzaId,
+                    participant: ctx.participant,
+                    quoted_text: ctx.quotedMessage?.conversation ||
+                                 ctx.quotedMessage?.extendedTextMessage?.text ||
+                                 null
+                };
+            }
+
+            await axios.post(WEBHOOK_URL, {
+                event: "message",
+                session: sessionId,
+                type,
+                id: msg.key.id,
+                chat: msg.key.remoteJid,
+                sender: msg.key.participant || msg.key.remoteJid,
+                from_me: msg.key.fromMe,
+                timestamp: msg.messageTimestamp,
+                text,
+                reply,
+                raw: msg
+            });
+
+        } catch (err) {
+            console.error(
+                `[${sessionId}] webhook error`,
+                err.message
+            );
+        }
+    }
+});
 
         watchSessionFiles(sessionId);
 
@@ -219,6 +276,7 @@ async function startSession(sessionId) {
     } finally {
         session.connecting = false;
     }
+    
 }
 
 /* ---------------- RESTORE ALL ---------------- */
