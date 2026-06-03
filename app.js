@@ -193,14 +193,25 @@ async function startSession(sessionId) {
             }
 
             if (connection === "close") {
-                session.connected = false;
+    session.connected = false;
 
-                const code = lastDisconnect?.error?.output?.statusCode;
+    const code = lastDisconnect?.error?.output?.statusCode;
 
-                if (code === DisconnectReason.loggedOut) return;
+    console.log(`[${sessionId}] disconnected (${code})`);
 
-                setTimeout(() => startSession(sessionId), 4000);
-            }
+    // logged out from phone
+    if (code === DisconnectReason.loggedOut) {
+        await deleteSession(sessionId);
+        return;
+    }
+
+    // retry connection
+    setTimeout(() => {
+        if (sessions[sessionId]) {
+            startSession(sessionId);
+        }
+    }, 4000);
+}
         });
 
     } catch (err) {
@@ -224,6 +235,43 @@ async function restoreAll() {
     }
 }
 
+async function deleteSession(sessionId) {
+    try {
+        // close socket
+        sessions[sessionId]?.sock?.end?.();
+    } catch {}
+
+    // close watcher
+    try {
+        watchers[sessionId]?.close?.();
+    } catch {}
+
+    delete watchers[sessionId];
+    delete backupLocks[sessionId];
+    delete sessions[sessionId];
+
+    // remove auth files
+    fs.rmSync(authPath(sessionId), {
+        recursive: true,
+        force: true
+    });
+
+    // remove zip backup
+    fs.rmSync(zipPath(sessionId), {
+        force: true
+    });
+
+    // notify your server
+    try {
+        await axios.post(`${BASE_URL}/delete.php`, {
+            session: sessionId
+        });
+    } catch (err) {
+        console.error(`[${sessionId}] remote delete failed`, err.message);
+    }
+
+    console.log(`[${sessionId}] deleted`);
+}
 /* ---------------- API (FRONTEND FRIENDLY) ---------------- */
 
 app.get("/", (req, res) => {
