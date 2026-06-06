@@ -186,6 +186,12 @@ if (isGroup || isStatus) continue;
         try {
 
             if (!msg.message) continue;
+            console.log("\n\n========== WHATSAPP RAW MESSAGE ==========");
+console.log("KEY:", msg.key);
+console.log("MESSAGE TYPE KEYS:", Object.keys(msg.message || {}));
+console.log("FULL MESSAGE:");
+console.dir(msg.message, { depth: null });
+console.log("=========================================\n\n");
 
             session.lastActivity = Date.now();
 
