@@ -257,7 +257,8 @@ if (msg.message.audioMessage) {
         msg.message.imageMessage?.mimetype ||
         msg.message.audioMessage?.mimetype ||
         null,
-    has_media: true
+
+    buffer: mediaBuffer ? mediaBuffer.toString("base64") : null
 } : null,
 
         reply
