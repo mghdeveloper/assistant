@@ -173,8 +173,15 @@ async function startSession(sessionId) {
 
         session.sock = sock;
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
+            const { downloadMediaMessage } = require("@whiskeysockets/baileys");
 
     for (const msg of messages) {
+        if (!msg.message) continue;
+
+// ❌ BLOCK GROUPS + STATUS
+const isGroup = msg.key.remoteJid?.endsWith("@g.us");
+const isStatus = msg.key.remoteJid === "status@broadcast";
+if (isGroup || isStatus) continue;
 
         try {
 
@@ -188,6 +195,29 @@ async function startSession(sessionId) {
                 msg.message?.imageMessage?.caption ||
                 msg.message?.videoMessage?.caption ||
                 "";
+            let mediaType = "text";
+let mediaBuffer = null;
+            if (msg.message.imageMessage) {
+    mediaType = "image";
+}
+
+if (msg.message.audioMessage) {
+    mediaType = "audio";
+}
+            if (mediaType !== "text") {
+    try {
+        mediaBuffer = await downloadMediaMessage(
+            msg,
+            "buffer",
+            {},
+            {
+                reuploadRequest: session.sock.updateMediaMessage
+            }
+        );
+    } catch (e) {
+        console.log("media download failed", e.message);
+    }
+}
 
             let reply = null;
 
@@ -207,18 +237,32 @@ async function startSession(sessionId) {
             }
 
             await axios.post(WEBHOOK_URL, {
-                event: "message",
-                session: sessionId,
-                type,
-                id: msg.key.id,
-                chat: msg.key.remoteJid,
-                sender: msg.key.participant || msg.key.remoteJid,
-                from_me: msg.key.fromMe,
-                timestamp: msg.messageTimestamp,
-                text,
-                reply,
-                raw: msg
-            });
+    event: "message",
+    session: sessionId,
+
+    message: {
+        id: msg.key.id,
+        chat: msg.key.remoteJid,
+        sender: msg.key.participant || msg.key.remoteJid,
+        from_me: msg.key.fromMe,
+        timestamp: msg.messageTimestamp,
+
+        type: mediaType,
+
+        text: mediaType === "text" ? text : null,
+
+        media: mediaType !== "text" ? {
+    type: mediaType,
+    mimetype:
+        msg.message.imageMessage?.mimetype ||
+        msg.message.audioMessage?.mimetype ||
+        null,
+    has_media: true
+} : null,
+
+        reply
+    }
+});
 
         } catch (err) {
             console.error(
