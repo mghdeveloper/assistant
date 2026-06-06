@@ -189,12 +189,22 @@ if (isGroup || isStatus) continue;
 
             session.lastActivity = Date.now();
 
-            const text =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                msg.message?.imageMessage?.caption ||
-                msg.message?.videoMessage?.caption ||
-                "";
+            function extractText(msg) {
+    const m = msg.message;
+
+    return (
+        m?.conversation ||
+        m?.extendedTextMessage?.text ||
+        m?.imageMessage?.caption ||
+        m?.videoMessage?.caption ||
+        m?.documentMessage?.caption ||
+        m?.ephemeralMessage?.message?.imageMessage?.caption ||
+        m?.ephemeralMessage?.message?.videoMessage?.caption ||
+        m?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+        null
+    );
+}
+            const text = extractText(msg);
             let mediaType = "text";
 let mediaBuffer = null;
             if (msg.message.imageMessage) {
